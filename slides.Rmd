@@ -87,8 +87,7 @@ df_clean <- df %>%
 
 ## Visual Inspection of Trends
 
-```{r network_visualization, fig.height=5, fig.width=10}
-# This plot still uses the moving average to show the overall context of the wave
+```{r network_visualization, fig.height=5, fig.width=10, echo=FALSE}
 top_provinces <- df_clean %>%
   group_by(denominazione_provincia) %>%
   summarise(total_volume = sum(nuovi_casi_ma7, na.rm = TRUE)) %>%
@@ -114,8 +113,8 @@ ggplot(df_plot, aes(x = data, y = nuovi_casi_ma7)) +
            label = "Reopening", hjust = 0, size = 3) +
   scale_color_brewer(palette = "Set1") +
   theme_minimal() +
-  labs(title = "Synchronization of Infection Curves (For Context)",
-       subtitle = "7-day Moving Average of New Cases. The network is built on the growth rate of these curves.",
+  labs(title = "Synchronization of Infection Curves",
+       subtitle = "7-day Moving Average of New Cases.",
        x = "Date",
        y = "New Cases (7-day MA)",
        color = "Province") +
@@ -235,7 +234,7 @@ grid()
 
 Did the "Lockdown" fragment the network or synchronize it?
 
-```{r temporal_viz, fig.height=4.5, echo=FALSE}
+```{r temporal_viz, fig.height=4.5, fig.width=10, echo=FALSE}
 # Helper to visualize phases
 build_phase_plot <- function(start, end, title) {
   wide <- df_clean %>% filter(data >= start & data <= end) %>%
@@ -281,7 +280,7 @@ ggraph(covid_graph_comm, layout = "fr") +
 
 **Result:** Communities group geographically proximate provinces but do **not** strictly respect regional borders. Contagion dynamics follow functional lines (commuters/transport) rather than administrative ones.
 
-## Q3.1 — The "Drivers" (Centrality)
+## Q3.1 — The Drivers (Centrality)
 
 Who drove the synchronization? We use **Eigenvector Centrality** to find influential nodes.
 
@@ -296,7 +295,7 @@ covid_graph %>%
   knitr::kable(caption = "Top Synchronizers")
 ```
 
-**Insight:** While Lombardy had the most *cases*, **Roma and Milano** were the network *hubs*. They acted as the "pulse" of the national trend, synchronizing the acceleration/deceleration across the country.
+**Insight:** While Lombardy had the most cases, **Roma and Milano** were the actual network hubs. They acted as the "pulse" of the national trend, synchronizing the acceleration/deceleration across the country.
 
 ## Q4 — Resilience: Percolation Analysis
 
@@ -324,13 +323,13 @@ lines(1:remove_n, res_rand/max(components(g_igraph)$csize), col="blue", lwd=3)
 legend("topright", c("Targeted (Hubs)", "Random"), col=c("red", "blue"), lwd=3)
 ```
 
-**Result:** The network is **robust to random failure** (Blue) but **extremely fragile to targeted attacks** (Red). Removing just top 20 hubs shatters the network.
+**Result:** The network is **robust to random failure** (Blue) but **extremely fragile to targeted attacks** (Red). Removing the top 20 hubs shatters the network.
 
 ## Conclusions
 
 This network analysis provides a structural view of the First Wave in Italy.
 
 1.  **Scale-Free Topology:** The epidemic followed a hierarchical structure driven by hubs.
-2.  **Lockdown Effect:** Almost paradoxically, the strict lockdown increased synchronization (higher density), while reopening fragmented the trends.
+2.  **Lockdown Effect:** The strict lockdown increased synchronization (higher density), while reopening fragmented the trends.
 3.  **The "Pulse" vs "Volume":** Transport hubs (Roma, Milano, Bologna) dictated the national timing (synchronization) more than the infection epicenters (e.g., Lodi).
-4.  **Policy Implication:** Future containment should prioritize "fire-breaking" major transport hubs. Disconnecting these specific nodes is highly efficient at breaking the national chain of contagion.
+4.  **Policy Implication:** Future containment should prioritize "fire-breaking" major transport hubs. Disconnecting these specific nodes is highly efficient at breaking the national chain of contagion, though political and economical needs may not allow this.
