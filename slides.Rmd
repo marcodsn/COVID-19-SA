@@ -40,10 +40,6 @@ library(tidygraph)
 library(ggraph)
 library(zoo)
 library(patchwork)
-
-# NOTE: In a real knitting scenario, ensure the CSV path is correct.
-# For this presentation, we assume the file exists as per the source report.
-# If the file is missing, these chunks might need eval=FALSE.
 ```
 
 ## Introduction
