@@ -1,0 +1,379 @@
+---
+title: "The Network of COVID-19 Contagion in Italy"
+subtitle: An analysis of synchronization among provinces
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+  pdf_document:
+    toc: true
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache = TRUE, message = FALSE, warning = FALSE, fig.align='center')
+```
+
+## 1. Introduction
+
+The objective of this project is to analyze the spread of COVID-19 in Italy as a **network of synchronization**. We define two provinces as "connected" if the trend of their **daily growth rates** of new cases is highly correlated (r > 0.45) over time. This methodology focuses on the dynamics of acceleration/deceleration, filtering out the common global trend of the epidemic wave to reveal true underlying connections.
+
+We focus on the **First Wave (Spring 2020)** to investigate:
+
+1.  **Topology:** Is the network scale-free?
+2.  **Temporal Evolution:** How did the network structure change between the strict Lockdown and the Reopening?
+3.  **Clustering:** Do infection communities respect administrative regional borders?
+4.  **Resilience:** How robust is this synchronization network to the removal of "hub" provinces?
+
+## 2. Data Import and Wrangling
+
+We utilized the province-level data released by the Dipartimento della Protezione Civile available at [https://github.com/pcm-dpc/COVID-19](https://github.com/pcm-dpc/COVID-19).
+We load the data and calculate the daily growth rate of the 7-day moving average of new cases. This metric makes the time series stationary, allowing for a more accurate correlation analysis. **Note:** We extend the date range to July 2020 to capture the "Reopening" phase for comparison.
+
+```{r libraries}
+library(tidyverse)
+library(lubridate)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(widyr)
+library(patchwork)
+library(zoo)
+```
+
+```{r import_clean}
+# Load Data
+df <- read_csv("data/dpc-covid19-ita-province.csv")
+
+# Define period: First Wave + Reopening (Feb - July 2020)
+start_date <- ymd("2020-02-24")
+end_date   <- ymd("2020-07-31")
+
+df_clean <- df %>%
+  select(-note) %>%
+  mutate(data = ymd_hms(data)) %>%
+  filter(data >= start_date & data <= end_date) %>%
+  filter(!denominazione_provincia %in% c("In fase di definizione/aggiornamento", 
+                                         "Fuori Regione / Provincia Autonoma")) %>%
+  arrange(denominazione_provincia, data) %>%
+  group_by(denominazione_provincia) %>%
+  # Fix zeros and fill gaps using 'fill'
+  mutate(totale_casi_fixed = if_else(
+    totale_casi == 0 & data > ymd("2020-03-01"), 
+    NA_real_, 
+    totale_casi
+  )) %>%
+  fill(totale_casi_fixed, .direction = "down") %>%
+  # Calculate daily new cases (First Difference)
+  mutate(
+    prev_totale = lag(totale_casi_fixed, default = 0),  # Shift by one day with lag()
+    diff_grezza = totale_casi_fixed - prev_totale,
+    nuovi_casi = if_else(diff_grezza < 0, 0, diff_grezza) # Fix negative adjustments
+  ) %>%
+  # Smooth with 7-day moving average
+  mutate(
+    nuovi_casi_ma7 = rollmean(nuovi_casi, k = 7, fill = NA, align = "right")
+  ) %>%
+  # Correlate the daily change (log-returns) to make the series stationary.
+  # This measures synchronization in acceleration/deceleration.
+  mutate(
+    growth_rate = log(nuovi_casi_ma7 + 1) - log(lag(nuovi_casi_ma7) + 1)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(growth_rate) & is.finite(growth_rate)) %>% # Remove NAs/Infinities
+  select(data, denominazione_provincia, denominazione_regione, nuovi_casi_ma7, growth_rate)
+
+head(df_clean)
+```
+
+```{r network_visualization}
+## 2.1 Visual Inspection of Trends (Context)
+
+# This plot still uses the moving average to show the overall context of the wave
+top_provinces <- df_clean %>%
+  group_by(denominazione_provincia) %>%
+  summarise(total_volume = sum(nuovi_casi_ma7, na.rm = TRUE)) %>%
+  slice_max(order_by = total_volume, n = 5) %>%
+  pull(denominazione_provincia)
+
+df_plot <- df_clean %>%
+  mutate(type = if_else(denominazione_provincia %in% top_provinces, 
+                        denominazione_provincia, "Other")) %>%
+  arrange(type != "Other")
+
+ggplot(df_plot, aes(x = data, y = nuovi_casi_ma7)) +
+  geom_line(data = filter(df_plot, type == "Other"), 
+            aes(group = denominazione_provincia), 
+            color = "gray85", size = 0.3, alpha = 0.8) +
+  geom_line(data = filter(df_plot, type != "Other"), 
+            aes(color = type), size = 1) +
+  geom_vline(xintercept = ymd("2020-03-09"), linetype = "dashed", color = "black") +
+  annotate("text", x = ymd("2020-03-12"), y = max(df_plot$nuovi_casi_ma7, na.rm=TRUE), 
+           label = "Lockdown", hjust = 0, size = 3) +
+  geom_vline(xintercept = ymd("2020-05-04"), linetype = "dashed", color = "black") +
+  annotate("text", x = ymd("2020-05-07"), y = max(df_plot$nuovi_casi_ma7, na.rm=TRUE), 
+           label = "Reopening", hjust = 0, size = 3) +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal() +
+  labs(title = "Synchronization of Infection Curves (For Context)",
+       subtitle = "7-day Moving Average of New Cases. The network is built on the growth rate of these curves.",
+       x = "Date",
+       y = "New Cases (7-day MA)",
+       color = "Province") +
+  theme(legend.position = "bottom")
+```
+
+## 3. Network Construction (The "Crisis" Network)
+
+We construct the main network using the peak crisis period (Feb-May 2020). Two provinces are connected if their **growth rate correlation is > 0.45**. This lower threshold is appropriate for noisier, stationary series like growth rates.
+
+```{r build_main_network}
+# Filter for the peak crisis period
+df_crisis <- df_clean %>% 
+  filter(data <= ymd("2020-05-31"))
+
+# 1. Pivot GROWTH_RATE to Wide Format
+df_wide <- df_crisis %>%
+  select(data, denominazione_provincia, growth_rate) %>%
+  pivot_wider(names_from = denominazione_provincia, values_from = growth_rate) %>%
+  select(-data)
+
+# 2. Compute Correlation Matrix
+cor_matrix <- cor(df_wide, use = "pairwise.complete.obs", method = "pearson")
+
+# 3. Flatten to Edge List
+cor_matrix[lower.tri(cor_matrix, diag = TRUE)] <- NA
+edges <- as.data.frame(as.table(cor_matrix)) %>%
+  na.omit() %>%
+  rename(from = Var1, to = Var2, weight = Freq) %>%
+  # A correlation of 0.45 for growth rates is significant.
+  filter(weight > 0.45)
+
+# 4. Nodes list (with Region info)
+nodes <- df_crisis %>%
+  distinct(denominazione_provincia, denominazione_regione) %>%
+  rename(name = denominazione_provincia, region = denominazione_regione)
+
+# 5. Build Tidygraph
+covid_graph <- tbl_graph(nodes = nodes, edges = edges, directed = FALSE) %>%
+  activate(nodes) %>%
+  mutate(deg = centrality_degree()) %>%
+  filter(deg > 0) # Remove isolated nodes
+
+covid_graph
+```
+
+## 4. RQ1: Topology & Scale-Free Property
+
+We analyze the degree distribution. A scale-free network follows a Power Law ($P(k) \sim C k^{-\alpha}$), implying the existence of "hubs" (super-synchronizers).
+
+```{r degree_dist}
+# Extract degree
+d <- degree(covid_graph)
+
+# 1. Skewness
+skewness <- function(x) mean((x - mean(x))^3) / sd(x)^3
+cat("Skewness of Degree Distribution:", round(skewness(d), 2), "\n")
+
+# 2. Log-Log Plot (CCDF)
+# A straight line suggests a Power Law
+ccdf <- function(d) {
+  n <- length(d)
+  max_d <- max(d)
+  p <- numeric(max_d)
+  for (i in 1:max_d) {
+    p[i] <- sum(d >= i) / n
+  } 
+  return(p)
+}
+
+p_dist <- ccdf(d)
+plot(1:length(p_dist), p_dist, log = "xy", type = "l", col = "firebrick", lwd = 2,
+     main = "Log-Log Plot of Degree Distribution (CCDF)", 
+     xlab = "Degree (k) [log scale]", ylab = "P(Degree >= k) [log scale]")
+grid()
+```
+
+The high skewness and the approximately linear trend in the log-log plot strongly suggest the network is **scale-free**, characterized by a few highly connected hubs and many sparsely connected nodes.
+
+## 5. RQ 1.1: Temporal Evolution (Lockdown vs. Reopening)
+
+Here we test if the network structure changed when the strict lockdown was lifted.
+
+*   **Lockdown:** March 9 - May 3
+*   **Reopening:** May 4 - July 15
+
+```{r temporal_compare, fig.width=12, fig.height=6}
+# Function to build graph for specific dates
+build_period_graph <- function(data, start, end, title) {
+  
+  period_data <- data %>% filter(data >= start & data <= end)
+  
+  wide <- period_data %>%
+    select(data, denominazione_provincia, growth_rate) %>%
+    pivot_wider(names_from = denominazione_provincia, values_from = growth_rate) %>%
+    select(-data)
+  
+  mat <- cor(wide, use = "pairwise.complete.obs")
+  mat[lower.tri(mat, diag = TRUE)] <- NA
+  edges_list <- as.data.frame(as.table(mat)) %>%
+    na.omit() %>%
+    rename(from = Var1, to = Var2, weight = Freq) %>%
+    filter(weight > 0.45) # Use consistent threshold
+  
+  g <- tbl_graph(nodes = nodes, edges = edges_list, directed = FALSE) %>%
+    activate(nodes) %>%
+    mutate(deg = centrality_degree()) %>%
+    filter(deg > 0)
+  
+  dens <- round(edge_density(g), 3)
+  
+  p <- ggraph(g, layout = "fr") + 
+    geom_edge_link(alpha = 0.2) + 
+    geom_node_point(aes(size = deg), color = "steelblue", show.legend = FALSE) + 
+    geom_node_text(aes(label = name), repel = TRUE, size = 3) +
+    theme_graph() + 
+    labs(title = paste(title), subtitle = paste("Density:", dens)) +
+    theme(legend.position = "none")
+  
+  return(p)
+}
+
+# 1. Lockdown
+p1 <- build_period_graph(df_clean, ymd("2020-03-09"), ymd("2020-05-03"), "Phase 1: Lockdown")
+
+# 2. Reopening
+p2 <- build_period_graph(df_clean, ymd("2020-05-04"), ymd("2020-07-15"), "Phase 2: Reopening")
+
+# Side-by-side plot
+p1 + p2
+```
+
+The contrast here is pretty stark. The Lockdown network is evidently more dense, suggesting that the national Lockdown acted like a very successful synchronization event. Upon reopening, the network became fragmented, probably in response to the newly introduced and ever-changing per-zone mobility limitations.
+
+## 6. RQ2: Community Detection
+
+We use the **Louvain algorithm** on the main crisis network to detect clusters of synchronization.
+
+```{r communities, fig.width=10, fig.height=8}
+set.seed(123)
+
+covid_graph_comm <- covid_graph %>%
+  activate(nodes) %>%
+  mutate(community = as.factor(group_louvain()))
+
+ggraph(covid_graph_comm, layout = "fr") + 
+  geom_edge_link(aes(alpha = weight), show.legend = FALSE) + 
+  geom_node_point(aes(color = community, size = deg)) + 
+  geom_node_text(aes(label = name), repel = TRUE, size = 3.5) +
+  theme_graph() +
+  labs(title = "Communities of Contagion Synchronization (Louvain)", 
+       subtitle = "Nodes colored by detected modularity class")
+```
+
+The communities detected often group geographically proximate provinces, but they do not strictly adhere to administrative regional borders. This suggests that contagion dynamics are driven more by functional connections (e.g., commuter flows, economic ties) than by administrative lines.
+
+## 7. RQ3: Centrality Analysis
+
+We identify the "drivers" of the epidemic synchronization using **Eigenvector Centrality**. High eigenvector centrality means a province is correlated with other highly correlated provinces, making it a key influencer in the network.
+
+```{r centrality}
+covid_graph_cent <- covid_graph %>%
+  activate(nodes) %>%
+  mutate(eigen = centrality_eigen())
+
+# Top 10 Drivers
+covid_graph_cent %>%
+  as_tibble() %>%
+  select(name, region, deg, eigen) %>%
+  arrange(desc(eigen)) %>%
+  head(10) %>%
+  knitr::kable(caption = "Top 10 Provinces by Eigenvector Centrality")
+```
+
+The analysis identifies provinces like **Roma, Milano and Bologna** as the primary hubs. These are major metropolitan and economic centers, and their high centrality suggests they acted as the key drivers for synchronizing the epidemic's growth rate across the country.
+
+## 8. RQ4: Resilience (Percolation)
+
+We test the network's robustness by simulating node removal based on degree (Targeted Attack) versus random removal (Random Failure). A scale-free network is expected to be resilient to random failures but fragile to targeted attacks on its hubs.
+
+```{r resilience}
+# Function to calculate giant component size
+percolate = function(g, size, d) {
+  giant = vector()
+  g_igraph = as.igraph(g)
+  
+  names(d) = 1:length(d)
+  d = sort(d, decreasing=TRUE)
+  ids = as.integer(names(d)) 
+  
+  for (i in 1:size) {
+    g_temp = delete_vertices(g_igraph, ids[1:i])
+    c = components(g_temp)
+    giant[i] = max(c$csize, 0) # Use max(..., 0) to handle empty graph
+  }
+  return(giant)
+}
+
+# Setup
+g_igraph <- as.igraph(covid_graph)
+total_nodes <- vcount(g_igraph)
+remove_count <- floor(total_nodes * 0.8) # Remove up to 80% of nodes
+
+# 1. Targeted (Degree)
+deg_seq <- degree(g_igraph)
+res_deg <- percolate(covid_graph, remove_count, d = deg_seq)
+
+# 2. Random
+set.seed(999)
+rand_seq <- sample(1:total_nodes, total_nodes)
+res_rand <- percolate(covid_graph, remove_count, d = setNames(rand_seq, 1:total_nodes))
+
+# Normalize by initial size
+initial_size <- max(components(g_igraph)$csize)
+res_deg_norm <- res_deg / initial_size
+res_rand_norm <- res_rand / initial_size
+
+# Plot
+plot(1:remove_count, res_deg_norm, type = "l", col = "red", lwd = 2.5, ylim = c(0, 1),
+     xlab = "Number of Nodes Removed", ylab = "Fraction of Giant Component Remaining",
+     main = "Network Resilience: Targeted vs. Random Node Removal")
+lines(1:remove_count, res_rand_norm, col = "blue", lwd = 2.5)
+grid()
+legend("topright", legend = c("Targeted Attack (Hubs)", "Random Failure"), 
+       col = c("red", "blue"), lty = 1, lwd = 2)
+```
+
+The percolation analysis confirms the network's scale-free nature. It is highly resilient to random failures (blue line), maintaining a large connected component even after many nodes are removed: even after removing 25 random provinces, the giant component remains over 50% intact. However, it is **extremely fragile to targeted attacks** (red line). Removing just the top 15-20 most connected hubs causes the network to completely shatter, breaking the nationwide synchronization.
+
+## 9. Conclusions
+
+This study analyzed the spread of COVID-19 in Italy not merely as a set of parallel time series, but as a **network of synchronization**, where connections represent correlated accelerations in the infection growth rate. By integrating the topological analysis with the newly generated resilience data, we derive four critical conclusions regarding the dynamics of the First Wave.
+
+### 1. Topology: A Scale-Free "Hub" Structure
+The network exhibits a clear **Scale-Free topology**, distinct from random networks.
+
+* **Skewness (1.66):** The degree distribution is highly positively skewed. This confirms that while most provinces had few synchronization links, a small minority acted as "super-connectors."
+* **Power Law:** The Log-Log plot of the degree distribution follows a close-to-linear decay, a big flag of scale-free networks. This implies that the epidemic's synchronization was hierarchical, driven by a few dominant nodes rather than diffused evenly across the country.
+
+### 2. The "Drivers" of Synchronization (Centrality)
+Eigenvector centrality analysis challenges the assumption that only the initial "Red Zones" (e.g., Bergamo, Lodi) drove the national trend. Instead, major administrative and transport hubs were the primary synchronizers:
+
+* **Roma (1.00)** and **Milano (0.96)** emerged as the most central nodes, followed by **Bologna (0.86)** and **Firenze (0.53)**.
+* **Interpretation:** While Lombardy had the highest *volume* of cases, Rome and Milan acted as the "pulse" of the network. Their trends were most predictive of the national trajectory, effectively synchronizing the acceleration and deceleration of the curve across the peninsula.
+
+### 3. Temporal Evolution: The "Lockdown Effect"
+Comparing the network structure across phases reveals the impact of policy on synchronization:
+
+* **Phase 1 (Lockdown) Density: 0.102**
+* **Phase 2 (Reopening) Density: 0.087**
+Contrary to intuitive expectations that a lockdown would "fragment" the network, the **synchronization density was actually higher during the lockdown**. This suggests that the "Io Resto a Casa" decree acted as a massive external force that synchronized the behavior of the entire country, forcing infection curves to bend in unison. The drop in density during reopening indicates a return to more heterogeneous, localized epidemic dynamics.
+
+### 4. Resilience: Robust to Random Failure, Fragile to Attack
+The final percolation analysis provides a definitive test of the network's structural integrity:
+
+* **Random Failure (Blue Line):** The network is highly resilient to random node removal. Even after removing 25 nodes randomly, a significant portion of the giant component (> 50%) remains intact.
+* **Targeted Attack (Red Line):** The network is extremely fragile to targeted interventions. Removing just the **top ~18-20 hubs** causes a catastrophic collapse of the network (the giant component fraction drops below 0.2).
+* **Policy Implication:** Future containment strategies should prioritize "fire-breaking" measures in the high-centrality transport hubs identified (Roma, Milano, Bologna). Disconnecting these specific nodes is far more efficient at breaking the national synchronization chain than uniform, nationwide restrictions.
